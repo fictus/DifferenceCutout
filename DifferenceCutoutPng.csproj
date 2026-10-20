@@ -1,0 +1,38 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<TargetFramework>net9.0-windows</TargetFramework>
+		<UseWindowsForms>true</UseWindowsForms>
+		<Nullable>enable</Nullable>
+		<ImplicitUsings>enable</ImplicitUsings>
+		<LangVersion>latest</LangVersion>
+		<AssemblyName>DifferenceCutoutPng</AssemblyName>
+		<RootNamespace>DifferenceCutoutPng</RootNamespace>
+		<Version>0.1.0</Version>
+	</PropertyGroup>
+
+	<!--
+    Reference the same Paint.NET assemblies your other plugins (object remover,
+    generative fill) already use. Either copy their <PackageReference> items here,
+    or point at the installed DLLs like below.
+  -->
+	<PropertyGroup>
+		<PdnDir>C:\Program Files\paint.net</PdnDir>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<!-- Paint.NET 5.x is split into many small assemblies (ComponentModel, PropertySystem, ObjectModel, ...).
+         Referencing every managed PaintDotNet.*.dll in the install folder avoids chasing them one by one.
+         Native DLLs matching the pattern only produce harmless "bad image" warnings. -->
+		<Reference Include="$(PdnDir)\PaintDotNet.*.dll" Exclude="$(PdnDir)\PaintDotNet.Native*.dll">
+			<Private>false</Private>
+		</Reference>
+	</ItemGroup>
+
+	<ItemGroup>
+		<!-- Match the ONNX Runtime version Paint.NET's other plugins load (1.24.4 here); ship onnxruntime.dll + DirectML.dll next to the plugin the same way. -->
+		<PackageReference Include="Microsoft.ML.OnnxRuntime.DirectML" Version="1.24.4" />
+		<EmbeddedResource Include="difference_matte.onnx" LogicalName="DifferenceCutoutPng.difference_matte.onnx" />
+	</ItemGroup>
+
+</Project>
