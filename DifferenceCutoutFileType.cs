@@ -22,7 +22,7 @@ public sealed class DifferenceCutoutFileTypeFactory : IFileTypeFactory
 }
 
 /// <summary>
-/// "Save as" type that stores only what differs between the canvas and a chosen base image
+/// "Save as" type that stores only what differs between the foreground layer and a chosen background layer
 /// as a transparent PNG. Save-only: it never appears in the Open dialog.
 /// </summary>
 public sealed class DifferenceCutoutFileType : PropertyBasedFileType
@@ -31,8 +31,7 @@ public sealed class DifferenceCutoutFileType : PropertyBasedFileType
 
     private enum PropertyNames
     {
-        BackgroundImage,
-        SizeMismatch,
+        BackgroundLayer,
         Device,
         Tolerance,
         Softness,
@@ -45,12 +44,6 @@ public sealed class DifferenceCutoutFileType : PropertyBasedFileType
     {
         Auto,
         Cpu
-    }
-
-    private enum SizeMode
-    {
-        Error,
-        Stretch
     }
 
     public DifferenceCutoutFileType()
@@ -77,9 +70,7 @@ public sealed class DifferenceCutoutFileType : PropertyBasedFileType
     {
         var props = new List<Property>
         {
-            new StringProperty(PropertyNames.BackgroundImage, string.Empty, 1024),
-            new StaticListChoiceProperty(PropertyNames.SizeMismatch,
-                new object[] { SizeMode.Error, SizeMode.Stretch }, 0),
+            new Int32Property(PropertyNames.BackgroundLayer, 1, 1, 99),
             new StaticListChoiceProperty(PropertyNames.Device,
                 new object[] { DeviceChoice.Auto, DeviceChoice.Cpu }, 0),
             new Int32Property(PropertyNames.Tolerance, 10, 0, 60),
@@ -96,15 +87,8 @@ public sealed class DifferenceCutoutFileType : PropertyBasedFileType
     {
         ControlInfo ui = CreateDefaultSaveConfigUI(props);
 
-        ui.SetPropertyControlValue(PropertyNames.BackgroundImage, ControlInfoPropertyNames.DisplayName,
-            "Background base image (required)");
-        ui.SetPropertyControlType(PropertyNames.BackgroundImage, PropertyControlType.FileChooser);
-
-        ui.SetPropertyControlValue(PropertyNames.SizeMismatch, ControlInfoPropertyNames.DisplayName,
-            "If sizes differ");
-        PropertyControlInfo sizeInfo = ui.FindControlForPropertyName(PropertyNames.SizeMismatch);
-        sizeInfo.SetValueDisplayName(SizeMode.Error, "Show an error");
-        sizeInfo.SetValueDisplayName(SizeMode.Stretch, "Stretch to canvas");
+        ui.SetPropertyControlValue(PropertyNames.BackgroundLayer, ControlInfoPropertyNames.DisplayName,
+            "Background layer number (1 = bottom layer)");
 
         ui.SetPropertyControlValue(PropertyNames.Device, ControlInfoPropertyNames.DisplayName,
             "Processing");
@@ -137,29 +121,60 @@ public sealed class DifferenceCutoutFileType : PropertyBasedFileType
         Surface scratchSurface,
         ProgressEventHandler progressCallback)
     {
-        string path = token.GetProperty<StringProperty>(PropertyNames.BackgroundImage).Value?.Trim() ?? string.Empty;
+        // Paint.NET calls Save in the background to draw the options-dialog preview. Never throw there
+        // (a failing preview breaks the dialog); show the unchanged image instead. A real save still
+        // reports problems with a clear message.
+        bool preview = IsOptionsDialogPreview();
 
-        if (path.Length == 0 || !File.Exists(path))
+        try
         {
-            // Paint.NET calls Save in the background to draw the options-dialog preview the moment the
-            // dialog opens, before a base image can possibly have been chosen. Don't fail there: show the
-            // unchanged image. A real save (OK button) without a base image still fails with a clear message.
-            if (IsOptionsDialogPreview())
-            {
-                input.Flatten(scratchSurface);
-                WritePng(scratchSurface, output);
-                return;
-            }
+            SaveCutout(input, output, token, scratchSurface, progressCallback);
+        }
+        catch (Exception) when (preview)
+        {
+            output.SetLength(0);
+            input.Flatten(scratchSurface);
+            WritePng(scratchSurface, output);
+        }
+    }
 
-            if (path.Length == 0)
-            {
-                throw new InvalidOperationException(
-                    "Difference Cutout PNG needs a background base image. Click Save again and choose one in the options dialog.");
-            }
-            throw new FileNotFoundException("The background base image could not be found.", path);
+    private void SaveCutout(
+        Document input,
+        Stream output,
+        PropertyBasedSaveConfigToken token,
+        Surface scratchSurface,
+        ProgressEventHandler progressCallback)
+    {
+        int w = input.Width, h = input.Height;
+
+        var bitmapLayers = new List<BitmapLayer>();
+        foreach (var layer in input.Layers)
+        {
+            if (layer is BitmapLayer bl) bitmapLayers.Add(bl);
         }
 
-        var sizeMode = (SizeMode)token.GetProperty<StaticListChoiceProperty>(PropertyNames.SizeMismatch).Value;
+        if (bitmapLayers.Count < 2)
+        {
+            throw new InvalidOperationException(
+                "Difference Cutout PNG needs at least two layers: a background layer and the layer to cut out.");
+        }
+
+        int bgNumber = token.GetProperty<Int32Property>(PropertyNames.BackgroundLayer).Value;
+        if (bgNumber < 1 || bgNumber > bitmapLayers.Count)
+        {
+            string names = string.Join(", ", bitmapLayers.Select((l, i) => $"{i + 1} = \"{l.Name}\""));
+            throw new InvalidOperationException(
+                $"Background layer number {bgNumber} doesn't exist; the image has {bitmapLayers.Count} layers " +
+                $"(numbered from the bottom: {names}). Click Save again and pick a valid layer number.");
+        }
+
+        BitmapLayer bgLayer = bitmapLayers[bgNumber - 1];
+        var foreground = bitmapLayers.Where(l => !ReferenceEquals(l, bgLayer) && l.Visible).ToList();
+        if (foreground.Count == 0)
+        {
+            throw new InvalidOperationException(
+                "There is no visible layer other than the background layer to cut out.");
+        }
 
         var device = (DeviceChoice)token.GetProperty<StaticListChoiceProperty>(PropertyNames.Device).Value;
 
@@ -175,14 +190,11 @@ public sealed class DifferenceCutoutFileType : PropertyBasedFileType
 
         void Report(double fraction) => progressCallback(this, new ProgressEventArgs(fraction * 100.0));
 
-        // Flatten all layers into the scratch surface (same size as the document).
-        input.Flatten(scratchSurface);
+        byte[] background = DifferenceMatte.SurfaceToBytes(bgLayer.Surface);
         Report(0.02);
 
-        byte[] background = DifferenceMatte.LoadBackground(
-            path, scratchSurface.Width, scratchSurface.Height, sizeMode == SizeMode.Stretch);
-
-        using Surface cutout = DifferenceMatte.Compute(scratchSurface, background, settings, Report);
+        using Surface canvas = DifferenceMatte.CompositeLayers(w, h, foreground);
+        using Surface cutout = DifferenceMatte.Compute(canvas, background, settings, Report);
 
         WritePng(cutout, output);
     }

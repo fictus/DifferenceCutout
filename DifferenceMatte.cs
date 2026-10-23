@@ -1,6 +1,4 @@
 using System.Drawing;
-using System.Drawing.Drawing2D;
-using System.Drawing.Imaging;
 using PaintDotNet;
 
 namespace DifferenceCutoutPng;
@@ -43,44 +41,63 @@ internal static class DifferenceMatte
 
     // ---------------------------------------------------------------- public API
 
-    /// <summary>Loads the base image as straight-alpha BGRA bytes at exactly w x h.</summary>
-    public static byte[] LoadBackground(string path, int w, int h, bool stretchIfDifferent)
+    /// <summary>Copies a layer's pixels into straight-alpha BGRA bytes (w x h x 4).</summary>
+    public static byte[] SurfaceToBytes(Surface surface)
     {
-        using var src = new Bitmap(path);
-
-        if ((src.Width != w || src.Height != h) && !stretchIfDifferent)
+        int w = surface.Width, h = surface.Height;
+        var result = new byte[w * h * 4];
+        Parallel.For(0, h, y =>
         {
-            throw new InvalidOperationException(
-                $"The background image is {src.Width}x{src.Height} but the canvas is {w}x{h}. " +
-                "Use an image with the same size, or choose \"Stretch to canvas\".");
-        }
-
-        using var bmp = new Bitmap(w, h, PixelFormat.Format32bppArgb);
-        using (var g = Graphics.FromImage(bmp))
-        using (var attrs = new ImageAttributes())
-        {
-            attrs.SetWrapMode(WrapMode.TileFlipXY);
-            g.CompositingMode = CompositingMode.SourceCopy;
-            g.InterpolationMode = InterpolationMode.HighQualityBicubic;
-            g.PixelOffsetMode = PixelOffsetMode.HighQuality;
-            g.DrawImage(src, new Rectangle(0, 0, w, h), 0, 0, src.Width, src.Height, GraphicsUnit.Pixel, attrs);
-        }
-
-        var data = bmp.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
-        try
-        {
-            var result = new byte[w * h * 4];
-            for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
             {
-                IntPtr row = data.Scan0 + y * data.Stride;
-                System.Runtime.InteropServices.Marshal.Copy(row, result, y * w * 4, w * 4);
+                ColorBgra c = surface[x, y];
+                int i = (y * w + x) * 4;
+                result[i] = c.B; result[i + 1] = c.G; result[i + 2] = c.R; result[i + 3] = c.A;
             }
-            return result;
-        }
-        finally
+        });
+        return result;
+    }
+
+    /// <summary>
+    /// Composites the given layers (bottom to top, normal blend, layer opacity) into a new surface.
+    /// Hidden layers are skipped. Caller owns the returned surface.
+    /// </summary>
+    public static Surface CompositeLayers(int w, int h, IReadOnlyList<BitmapLayer> layers)
+    {
+        var result = new Surface(w, h);
+        result.Fill(ColorBgra.FromBgra(0, 0, 0, 0));
+
+        foreach (BitmapLayer layer in layers)
         {
-            bmp.UnlockBits(data);
+            Surface src = layer.Surface;
+            int opacity = layer.Opacity;
+            Parallel.For(0, h, y =>
+            {
+                for (int x = 0; x < w; x++)
+                {
+                    ColorBgra s = src[x, y];
+                    int sa = (s.A * opacity + 127) / 255;
+                    if (sa == 0) continue;
+
+                    ColorBgra d = result[x, y];
+                    if (sa == 255 || d.A == 0)
+                    {
+                        result[x, y] = ColorBgra.FromBgra(s.B, s.G, s.R, (byte)sa);
+                        continue;
+                    }
+
+                    // straight-alpha "over"
+                    float fa = sa / 255f, da = d.A / 255f;
+                    float oa = fa + da * (1f - fa);
+                    float inv = 1f / oa;
+                    byte ob = (byte)Math.Clamp((s.B * fa + d.B * da * (1f - fa)) * inv + 0.5f, 0f, 255f);
+                    byte og = (byte)Math.Clamp((s.G * fa + d.G * da * (1f - fa)) * inv + 0.5f, 0f, 255f);
+                    byte or = (byte)Math.Clamp((s.R * fa + d.R * da * (1f - fa)) * inv + 0.5f, 0f, 255f);
+                    result[x, y] = ColorBgra.FromBgra(ob, og, or, (byte)Math.Clamp(oa * 255f + 0.5f, 0f, 255f));
+                }
+            });
         }
+        return result;
     }
 
     /// <summary>Builds the transparent cutout. Caller owns (and must dispose) the returned surface.</summary>
